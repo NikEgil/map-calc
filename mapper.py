@@ -167,9 +167,9 @@ class HeatMap:
         self,
         model=RBF(),
         resolution=200,
-        levels=7,
+        levels=10,
         rel_tolerance=1e-6,
-        coef=100,
+        coef=0,
         description="Показатель",
         postfix="",
     ):
