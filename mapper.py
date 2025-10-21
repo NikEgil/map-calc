@@ -542,7 +542,7 @@ class HeatMap:
                     "id": f"contour-{i}",
                     "name": f"Контур {i}",
                     "description": f"{description} {z_true:.2f} {postfix}".strip(),
-                    "level": float(z),
+                    "level": round(z,2),
                 },
             }
             features.append(feature)
