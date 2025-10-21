@@ -63,6 +63,19 @@ class CombiMap():
         
         return bridge_poly
 
+
+    def invert_coords(self,coords):
+        """
+        Меняет местами x и y в каждом элементе списка координат.
+        
+        Args:
+            coords (list[list[float]]): Список координат вида [[x1, y1], [x2, y2], ...]
+            
+        Returns:
+            list[list[float]]: Список координат вида [[y1, x1], [y2, x2], ...]
+        """
+        return [[y, x] for x, y in coords]
+
    
     def connect_all_polygons(self,*polygons):
         """
