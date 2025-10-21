@@ -8,10 +8,131 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import LeaveOneOut
 from sklearn.metrics import r2_score
 from RBFlib import RBF
-from shapely.geometry import Polygon, MultiPolygon
+from shapely.geometry import Polygon, MultiPolygon, LineString
 from shapely.ops import unary_union
 from simplification.cutil import simplify_coords_vw
 import json
+from itertools import combinations
+import copy
+
+
+class CombiMap():
+    def __init__(
+        self,
+    ):self
+
+    def _edges_from_polygon(self,poly):
+        """Возвращает список рёбер (LineString) внешнего кольца полигона."""
+        coords = list(poly.exterior.coords)
+        edges = []
+        for i in range(len(coords) - 1):
+            edge = LineString([coords[i], coords[i + 1]])
+            edges.append(edge)
+        return edges
+
+    def _closest_edges(self,poly1, poly2):
+        """Находит пару ближайших рёбер между двумя полигонами."""
+        edges1 = self._edges_from_polygon(poly1)
+        edges2 = self._edges_from_polygon(poly2)
+        
+        min_dist = float('inf')
+        best_pair = None
+        
+        for e1 in edges1:
+            for e2 in edges2:
+                dist = e1.distance(e2)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_pair = (e1, e2)
+        
+        return best_pair  # (LineString, LineString)
+
+    def _bridge_between_edges(self,edge1, edge2):
+        """Создаёт четырёхугольный мостик между двумя рёбрами."""
+        a1, a2 = edge1.coords[0], edge1.coords[1]
+        b1, b2 = edge2.coords[0], edge2.coords[1]
+        
+        # Строим четырёхугольник: a1 → a2 → b2 → b1 → a1
+        bridge_coords = [a1, a2, b2, b1]
+        bridge_poly = Polygon(bridge_coords)
+        
+        # Если невалиден — используем выпуклую оболочку точек
+        if not bridge_poly.is_valid:
+            from shapely.geometry import MultiPoint
+            bridge_poly = MultiPoint([a1, a2, b1, b2]).convex_hull
+        
+        return bridge_poly
+
+   
+    def connect_all_polygons(self,*polygons):
+        """
+        Соединяет все пары полигонов четырёхугольными мостиками,
+        объединяет всё в MultiPolygon, берёт внешний контур и возвращает как список координат вершин.
+        
+        Parameters:
+            *polygons : list[]
+                Один или несколько полигонов.
+        
+        Returns:
+            list[[x1,y1]]
+        """
+        if not polygons:
+            raise ValueError("Должен быть хотя бы один полигон.")
+        
+        polys = [Polygon(p) for p in polygons]
+        if len(polys) == 0:
+            raise ValueError("Нет валидных полигонов.")
+        if len(polys) == 1:
+            return polys[0]
+
+        # Список всех геометрий для объединения
+        geometries = list(polys)
+        
+        # Добавляем мостики между всеми парами
+        for poly_a, poly_b in combinations(polys, 2):
+            edge_a, edge_b = self._closest_edges(poly_a, poly_b)
+            bridge = self._bridge_between_edges(edge_a, edge_b)
+            geometries.append(bridge)
+        
+        # Объединяем всё в один объект
+        merged = unary_union(geometries)
+        
+        # Берём внешний контур: создаем Polygon из внешнего кольца
+        if merged.geom_type == 'Polygon':
+            outer_contour = Polygon(merged.exterior)
+        elif merged.geom_type == 'MultiPolygon':
+            # Берём внешнее кольцо самого большого компонента (или объединяем все)
+            # Лучше: объединить все компоненты в один контур
+            all_exteriors = []
+            for geom in merged.geoms:
+                all_exteriors.extend(list(geom.exterior.coords))
+            
+            # Создаём новый полигон по всем точкам внешних колец
+            # Это не всегда корректно, но для внешнего контура подойдёт
+            from shapely.geometry import MultiPoint
+            hull = MultiPoint(all_exteriors).convex_hull
+            
+            # Но если нужен точный контур — лучше использовать buffer(0) + exterior
+            merged_simplified = merged.buffer(0)  # исправляет геометрию
+            if merged_simplified.geom_type == 'Polygon':
+                outer_contour = Polygon(merged_simplified.exterior)
+            else:
+                # Финальный fallback: выпуклая оболочка
+                outer_contour = merged.convex_hull
+        else:
+            # Например, GeometryCollection — делаем convex hull
+            outer_contour = merged.convex_hull
+        
+        # Гарантируем, что результат — Polygon
+        if outer_contour.geom_type != 'Polygon':
+            # Пробуем ещё раз через buffer(0)
+            outer_contour = outer_contour.buffer(0)
+            if outer_contour.geom_type != 'Polygon':
+                raise RuntimeError(f"Не удалось создать внешний контур. Тип: {outer_contour.geom_type}")
+
+
+        return list(outer_contour.exterior.coords)
+
 
 
 class HeatMap:
@@ -429,7 +550,7 @@ class HeatMap:
             raise ValueError("Количество полигонов и значений z должно совпадать.")
         return [[[x, y, z] for x, y in poly] for poly, z in zip(polygons_2d, z_values)]
 
-    def _plot_polygons(self, polygons, save_pic=False):
+    def _plot_polygons(self, polygons,outer_contour=None, save_pic=False):
         """
         Визуализирует список трёхмерных полигонов на 2D-плоскости с цветовой кодировкой по высоте (z).
 
@@ -469,6 +590,23 @@ class HeatMap:
         p = PatchCollection(patches, cmap="viridis", alpha=1, edgecolor="black", linewidth=0.5)
         p.set_array(np.array(z_values))
         ax.add_collection(p)
+        if outer_contour is not None and len(outer_contour) >= 2:
+            # Определяем, 2D или 3D
+            first_point = outer_contour[0]
+            if len(first_point) == 3:
+                contour_xy = [(x, y) for x, y, z in outer_contour]
+            elif len(first_point) == 2:
+                contour_xy = [(x, y) for x, y in outer_contour]
+            else:
+                raise ValueError("Точки контура должны быть 2D или 3D.")
+
+            # Замыкаем контур, если нужно
+            if contour_xy[0] != contour_xy[-1]:
+                contour_xy = contour_xy + [contour_xy[0]]
+
+        xs, ys = zip(*contour_xy)
+        ax.plot(xs, ys, color='red', linewidth=2, label='Outer Contour')
+
         ax.set_aspect("equal")
         ax.autoscale_view()
         plt.colorbar(p, ax=ax, shrink=0.8)
@@ -641,7 +779,7 @@ class HeatMap:
             values, coordinates, borders=borders, model=model,
             resolution=resolution, normalize=True, validation=validation, gap=20
         )
-
+        old_borders=copy.copy(list(borders.exterior.coords))
         if borders_smooth:
             borders = self._rounded_bounding_box(borders, scale_factor=0.1)
 
@@ -661,12 +799,12 @@ class HeatMap:
 
         if show:
             print("оригинальная карта")
-            self._plot_polygons(polygons)
+            self._plot_polygons(polygons,old_borders)
             print("обрезанная по границам карта")
-            self._plot_polygons(clpolygons)
+            self._plot_polygons(clpolygons,old_borders)
             print("упрощённая обрезанная карта")
             simple_polygon = self._add_z_to_polygons(poly_2d, z_orig)
-            self._plot_polygons(simple_polygon)
+            self._plot_polygons(simple_polygon,old_borders)
 
         if savejson:
             with open("output.geojson", "w", encoding="utf-8") as f:
@@ -739,7 +877,7 @@ class HeatMap:
     def example(self,show=True,info=True,**kwargs):
             
         # surface_points = generate_surface(50, (41, 42), (41, 42))
-        surface_points = self.generate_surface(50, (38,39), (44,45))
+        surface_points = self.generate_surface(50, (38,38.5), (44.5,45))
         # словари с точками на поверхности
 
         coordinates, values = {}, {}
@@ -747,6 +885,11 @@ class HeatMap:
             coordinates[str(i)] = surface_points[i][0:2]
             values[str(i)] = surface_points[i][2]
 
-        # borders = [[41, 41], [41.01, 41.08], [41.1, 41.07], [41.08, 41.01]]
-        borders=[[38.325028129599445, 44.801244059395145], [38.324053590364436, 44.80125569721126], [38.32253024027987, 44.80156672143066], [38.32044022536299, 44.79713720648287], [38.32236868182294, 44.79713375238517], [38.322932643307745, 44.7986287318651], [38.32252876318088, 44.798831590575766], [38.322542038101325, 44.79900504491131], [38.32368606505626, 44.798828150388616], [38.325807058097105, 44.80111160795484], [38.325723436848776, 44.80139810501211], [38.32500475949873, 44.80141762291188], [38.325028129599445, 44.801244059395145]]
-        self.map_calc(coordinates,values,borders,show=show,info=info,**kwargs)
+        borders2=[[38.320908920265374, 44.804199031579394], [38.32070802704981, 44.80280195746109], [38.31983277608082, 44.80250353325786], [38.31963414218973, 44.800314300374694], [38.319327824543, 44.79875384778615], [38.31949042409535, 44.798351400547816], [38.320869090311646, 44.798251952110434], [38.321375050817906, 44.79927702148068], [38.32238788517998, 44.80166837840979], [38.32161516066009, 44.80180528747301], [38.321538840650156, 44.80345451255993], [38.320908920265374, 44.804199031579394]]
+        borders1=[[38.325028129599445, 44.801244059395145], [38.324053590364436, 44.80125569721126], [38.32253024027987, 44.80156672143066], [38.32044022536299, 44.79713720648287], [38.32236868182294, 44.79713375238517], [38.322932643307745, 44.7986287318651], [38.32252876318088, 44.798831590575766], [38.322542038101325, 44.79900504491131], [38.32368606505626, 44.798828150388616], [38.325807058097105, 44.80111160795484], [38.325723436848776, 44.80139810501211], [38.32500475949873, 44.80141762291188], [38.325028129599445, 44.801244059395145]]
+        
+        comb=CombiMap()
+        uborder=comb.connect_all_polygons(borders1,borders2)
+        self.map_calc(coordinates,values,uborder,show=show,info=info,**kwargs)
+
+
